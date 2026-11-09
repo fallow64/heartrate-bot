@@ -8,6 +8,7 @@
 import json
 import logging
 import os
+import signal
 import sqlite3
 import sys
 import time
@@ -29,10 +30,10 @@ CHART_NAME = "heart-rate.png"
 CHART_URL = f"attachment://{CHART_NAME}"
 
 ALERT_ROLE_ID = "1569219369056346153"
-ALERT_BPM = 160
-ALERT_RESET_BPM = 140  # an episode ends once it drops below this
+ALERT_BPM = 150
+ALERT_RESET_BPM = 135  # an episode ends once it drops below this
 ALERT_HOLD_READINGS = 3  # consecutive readings at ALERT_BPM, so sensor spikes don't ping
-ALERT_COOLDOWN_SECONDS = 30 * 60
+ALERT_COOLDOWN_SECONDS = 60  # counted from when the last episode ended
 
 PULSOID_URL = "https://dev.pulsoid.net/api/v1/data/heart_rate/latest"
 DISCORD_URL = "https://discord.com/api/v10"
@@ -44,13 +45,18 @@ GREY = 0x747F8D
 log = logging.getLogger("heartrate")
 
 
+def offline_embed(measured_at: int | None) -> dict:
+    description = f"last seen <t:{measured_at}:R>" if measured_at else "no readings yet"
+    return {"title": "💤 Offline", "description": description, "color": GREY}
+
+
 def render(reading: tuple[int, int] | None, now: float) -> dict:
     """Build the embed for a (bpm, measured_at_seconds) reading, or None if there is no data."""
     if reading is None:
-        return {"title": "💤 Offline", "description": "no readings yet", "color": GREY}
+        return offline_embed(None)
     bpm, measured_at = reading
     if now - measured_at > OFFLINE_AFTER_SECONDS:
-        return {"title": "💤 Offline", "description": f"last seen <t:{measured_at}:R>", "color": GREY}
+        return offline_embed(measured_at)
     return {"title": f"❤️ {bpm} BPM", "description": f"updated <t:{measured_at}:R>", "color": RED}
 
 
@@ -100,8 +106,9 @@ class Bot:
         self.last_embed: dict | None = None
         self.has_chart = False
         self.chart_at = 0.0
+        self.edit_allowed_at = 0.0  # time.monotonic() when Discord will accept another edit
         self.ping_id: str | None = state.get("ping_id")
-        self.pinged_at: float = state.get("pinged_at", 0)
+        self.episode_ended_at: float = state.get("episode_ended_at", 0)
         self.episode: dict | None = state.get("episode")  # {bpm, peak, started, last} while a ping is active
         self.streak: list[tuple[int, int]] = []  # consecutive high readings before a ping
         self.alert_checked_at: int | None = None
@@ -116,7 +123,7 @@ class Bot:
         state = {
             "message_id": self.message_id,
             "ping_id": self.ping_id,
-            "pinged_at": self.pinged_at,
+            "episode_ended_at": self.episode_ended_at,
             "episode": self.episode,
         }
         self.state_file.write_text(json.dumps(state))
@@ -126,11 +133,11 @@ class Bot:
         self.has_chart = False
         self.save_state()
 
-    def request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        """Call Discord, waiting out any 429s."""
+    def request(self, method: str, path: str, wait_if_limited: bool = True, **kwargs) -> httpx.Response:
+        """Call Discord, waiting out any 429s unless told not to."""
         for _ in range(5):
             response = self.discord.request(method, path, **kwargs)
-            if response.status_code != 429:
+            if response.status_code != 429 or not wait_if_limited:
                 return response
             wait = float(response.headers.get("retry-after", 5))
             log.warning("rate limited on %s %s, waiting %.1fs", method, path, wait)
@@ -174,9 +181,22 @@ class Bot:
         self.chart_at = now
         return chart
 
+    def note_edit_limit(self, response: httpx.Response) -> None:
+        """Remember when Discord says the next edit can go through."""
+        headers = response.headers
+        if response.status_code == 429:
+            wait = float(headers.get("retry-after", 5))
+        elif headers.get("x-ratelimit-remaining") == "0":
+            wait = float(headers.get("x-ratelimit-reset-after", 0))
+        else:
+            return
+        self.edit_allowed_at = time.monotonic() + wait
+
     def send(self, method: str, path: str, embed: dict, chart: bytes | None) -> httpx.Response:
         """Send the embed, uploading a new chart or reusing the one already on the message."""
         if chart:
+            if method == "PATCH":  # a chart is worth a short wait, unlike a number the next reading replaces
+                time.sleep(max(0, self.edit_allowed_at - time.monotonic()))
             embed = {**embed, "image": {"url": CHART_URL}}
             payload = {"embeds": [embed], "attachments": [{"id": 0, "filename": CHART_NAME}]}
             response = self.request(
@@ -188,7 +208,9 @@ class Bot:
         else:
             if self.has_chart:  # must stay attachment://, or Discord shows the file a second time
                 embed = {**embed, "image": {"url": CHART_URL}}
-            response = self.request(method, path, json={"embeds": [embed]})
+            response = self.request(method, path, wait_if_limited=method != "PATCH", json={"embeds": [embed]})
+        if method == "PATCH":
+            self.note_edit_limit(response)
         if response.is_success:
             embeds = response.json().get("embeds") or [{}]
             self.has_chart = "image" in embeds[0]
@@ -197,9 +219,14 @@ class Bot:
     def publish(self, embed: dict, chart: bytes | None = None) -> None:
         if self.message_id and embed == self.last_embed and chart is None:
             return
+        if self.message_id and chart is None and time.monotonic() < self.edit_allowed_at:
+            return
         path = f"/channels/{self.channel_id}/messages"
         if self.message_id:
             response = self.send("PATCH", f"{path}/{self.message_id}", embed, chart)
+            if response.status_code == 429:
+                log.warning("rate limited, skipping this update")
+                return
             if response.status_code == 404 and response.json().get("code") == UNKNOWN_MESSAGE:
                 log.info("message is gone, sending a new one")
                 self.remember(None)
@@ -217,13 +244,13 @@ class Bot:
         log.info("sent message %s: %s", self.message_id, embed["title"])
 
     def keep_at_bottom(self) -> None:
-        """If our message is no longer the newest in the channel, drop it so a new one gets sent."""
+        """If anything but our ping is below our message, drop it so a new one gets sent."""
         if not self.message_id:
             return
         path = f"/channels/{self.channel_id}/messages"
-        response = self.request("GET", path, params={"limit": 1})
+        response = self.request("GET", path, params={"limit": 2})
         response.raise_for_status()
-        newest = response.json()
+        newest = [message for message in response.json() if message["id"] != self.ping_id]
         if newest and newest[0]["id"] == self.message_id:
             return
         deleted = self.request("DELETE", f"{path}/{self.message_id}")
@@ -232,7 +259,7 @@ class Bot:
         log.info("no longer the newest message, moving to the bottom")
         self.remember(None)
 
-    def send_ping(self, bpm: int, now: float) -> None:
+    def send_ping(self, bpm: int) -> None:
         path = f"/channels/{self.channel_id}/messages"
         response = self.request(
             "POST",
@@ -242,7 +269,6 @@ class Bot:
         response.raise_for_status()
         previous = self.ping_id
         self.ping_id = response.json()["id"]
-        self.pinged_at = now
         self.episode = {
             "bpm": bpm,
             "peak": max(high for high, _ in self.streak),
@@ -257,9 +283,10 @@ class Bot:
             if deleted.status_code not in (204, 404):
                 log.warning("couldn't delete old ping (HTTP %d)", deleted.status_code)
 
-    def finish_episode(self) -> None:
+    def finish_episode(self, now: float) -> None:
         """Add how the episode went to its ping. Editing doesn't notify anyone again."""
         episode, self.episode = self.episode, None
+        self.episode_ended_at = now
         self.save_state()
         summary = f"peaked at {episode['peak']} BPM · lasted {duration_text(episode['last'] - episode['started'])}"
         response = self.request(
@@ -275,7 +302,7 @@ class Bot:
         if reading is None or now - reading[1] > OFFLINE_AFTER_SECONDS:
             self.streak = []
             if self.episode:
-                self.finish_episode()
+                self.finish_episode(now)
             return
         bpm, measured_at = reading
         if measured_at == self.alert_checked_at:
@@ -288,12 +315,12 @@ class Bot:
                 self.episode["peak"] = bpm
                 self.save_state()
             if bpm < ALERT_RESET_BPM:
-                self.finish_episode()
+                self.finish_episode(now)
             return
 
         self.streak = [*self.streak, (bpm, measured_at)] if bpm >= ALERT_BPM else []
-        if len(self.streak) >= ALERT_HOLD_READINGS and now - self.pinged_at >= ALERT_COOLDOWN_SECONDS:
-            self.send_ping(bpm, now)
+        if len(self.streak) >= ALERT_HOLD_READINGS and now - self.episode_ended_at >= ALERT_COOLDOWN_SECONDS:
+            self.send_ping(bpm)
 
     def tick(self) -> None:
         now = time.time()
@@ -309,6 +336,24 @@ class Bot:
         embed = render(reading, now)
         self.publish(embed, self.make_chart(now) if self.chart_due(embed, now) else None)
 
+    def go_offline(self) -> None:
+        """Mark the message offline on the way out, keeping the chart that's on it."""
+        if not self.message_id or not self.last_embed:  # nothing was published this run
+            return
+        samples = self.history.samples()
+        embed = offline_embed(samples[-1][0] if samples else None)
+        path = f"/channels/{self.channel_id}/messages/{self.message_id}"
+        try:
+            for _ in range(3):  # unlike live updates, nothing comes after this one, so wait for it
+                time.sleep(max(0, self.edit_allowed_at - time.monotonic()))
+                response = self.send("PATCH", path, embed, None)
+                if response.status_code != 429:
+                    break
+            response.raise_for_status()
+            log.info("marked offline")
+        except httpx.HTTPError as error:
+            log.warning("couldn't mark offline: %r", error)
+
     def run(self) -> None:
         self.check_channel()
         while True:
@@ -318,6 +363,11 @@ class Bot:
             except (httpx.HTTPError, ValueError, KeyError) as error:
                 log.warning("tick failed, will retry: %r", error)
             time.sleep(max(0, TICK_SECONDS - (time.monotonic() - started)))
+
+
+def interrupt(*_) -> None:
+    """Treat a stop signal the same as Ctrl+C."""
+    raise KeyboardInterrupt
 
 
 def main() -> None:
@@ -339,9 +389,15 @@ def main() -> None:
         },
         timeout=10,
     )
+    signal.signal(signal.SIGTERM, interrupt)
+    bot = Bot(pulsoid, discord, os.environ["DISCORD_CHANNEL_ID"])
     try:
-        Bot(pulsoid, discord, os.environ["DISCORD_CHANNEL_ID"]).run()
-    except KeyboardInterrupt:
+        try:
+            bot.run()
+        except KeyboardInterrupt:
+            log.info("stopping")
+            bot.go_offline()
+    except KeyboardInterrupt:  # a second Ctrl+C skips the offline edit
         pass
 
 
